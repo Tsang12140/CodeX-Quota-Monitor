@@ -1,0 +1,21 @@
+# 私人邮箱与 SMTP 授权码（仅在本机保留）
+/config.ps1
+/config.local.ps1
+/.env
+/.env.*
+
+# Codex 登录令牌与本地凭据
+/auth.json
+*.token
+*.secret
+*.key
+*.pfx
+
+# 个人运行记录与额度历史
+/state.json
+/monitor.log
+/monitor_data.csv
+
+# PowerShell/Windows 本地文件
+*.user.ps1
+*.code-workspace
