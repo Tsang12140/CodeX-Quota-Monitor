@@ -15,6 +15,7 @@
 /state.json
 /monitor.log
 /monitor_data.csv
+/monitor_data_v2.csv
 
 # PowerShell/Windows 本地文件
 *.user.ps1

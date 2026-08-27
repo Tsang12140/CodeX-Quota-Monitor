@@ -25,4 +25,13 @@ $TokenUrl     = 'https://auth.openai.com/oauth/token'
 $ScriptDir = $PSScriptRoot
 $StateFile = Join-Path $ScriptDir 'state.json'
 $LogFile   = Join-Path $ScriptDir 'monitor.log'
-$CsvFile   = Join-Path $ScriptDir 'monitor_data.csv'
+$CsvFile   = Join-Path $ScriptDir 'monitor_data_v2.csv'
+
+# ===== 提前重置识别规则 =====
+# 按期重置允许最多提前 90 分钟，以容纳接口和每 10 分钟计划任务的时间误差；
+# 真正早于这个宽限期的 7 天总额度回补才会邮件通知。
+$NaturalResetEarlyToleranceMinutes = 90
+# 上一次至少使用了 15%，本次总额度至少回补 15 个百分点，才视为一次重置。
+$RefillMinimumPercent = 15
+$RefillStartRemainingPercent = 85
+$EarlyResetNotificationCooldownHours = 6

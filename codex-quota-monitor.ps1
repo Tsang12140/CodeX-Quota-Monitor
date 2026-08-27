@@ -1,4 +1,5 @@
 ﻿# 监控 Codex(ChatGPT Plus) 的额度重置：一旦 OpenAI 发放了可用的重置额度，立刻邮件通知。
+# 注意：5 小时 primary_window 的正常恢复只记录状态；仅 7 天 secondary_window 的提前回补会发邮件。
 # 用法：
 #   正常监控：powershell -NoProfile -ExecutionPolicy Bypass -File codex-quota-monitor.ps1
 #   测试邮件：powershell -NoProfile -ExecutionPolicy Bypass -File codex-quota-monitor.ps1 -TestMail
@@ -24,10 +25,10 @@ function Write-Log([string]$msg) {
 # 把一次检查的结构化数据追加到 CSV（用于日后画图表）。表头自动创建。
 function Append-DataCsv([hashtable]$row) {
   $fields = @(
-    'checked_at','used_percent','remaining_percent','reset_at','reset_at_time',
-    'reset_after_seconds','limit_window_seconds','plan_type','limit_reached',
-    'credits_available_count','credits_has_credits','approx_local_messages',
-    'approx_cloud_messages','reset_detected','mail_sent','prev_used_percent'
+    'checked_at',
+    'primary_remaining_percent','primary_reset_at','primary_reset_at_time','primary_window_seconds',
+    'secondary_remaining_percent','secondary_reset_at','secondary_reset_at_time','secondary_window_seconds',
+    'reset_event_type','mail_sent','plan_type','limit_reached'
   )
   $newFile = -not (Test-Path $CsvFile)
   $sb = New-Object System.Text.StringBuilder
@@ -47,6 +48,20 @@ function Decode-JwtPayload([string]$jwt) {
   switch ($p.Length % 4) { 2 { $p += '==' } 3 { $p += '=' } }
   $p = $p.Replace('-', '+').Replace('_', '/')
   [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($p)) | ConvertFrom-Json
+}
+
+function Format-ResetAt([long]$unixSeconds) {
+  if ($unixSeconds -le 0) { return '未知' }
+  return [DateTimeOffset]::FromUnixTimeSeconds($unixSeconds).LocalDateTime.ToString('yyyy-MM-dd HH:mm:ss')
+}
+
+function Format-Duration([long]$seconds) {
+  $seconds = [Math]::Max(0, $seconds)
+  if ($seconds -ge 86400) {
+    return "{0}天{1}小时" -f [Math]::Floor($seconds / 86400), [Math]::Floor(($seconds % 86400) / 3600)
+  }
+  if ($seconds -ge 3600) { return "{0}小时" -f [Math]::Floor($seconds / 3600) }
+  return "{0}分钟" -f [Math]::Floor($seconds / 60)
 }
 
 function Send-Mail([string]$subject, [string]$body) {
@@ -123,7 +138,7 @@ if ($needRefresh -and $refreshToken) {
   }
 }
 
-# 3. 查询额度使用百分比
+# 3. 查询两个额度窗口。primary 是短期（目前约 5 小时）窗口，secondary 是约 7 天的总额度窗口。
 $headers = @{ Authorization = "Bearer $accessToken"; 'User-Agent' = 'codex' }
 try {
   $data = Invoke-RestMethod -Uri $RateLimitUrl -Headers $headers -Method Get
@@ -134,100 +149,155 @@ try {
   exit 1
 }
 
-$pw = $data.rate_limit.primary_window
-$curUsed   = [int]$pw.used_percent
-$curResetAt= [long]$pw.reset_at
-$curResetTime = if ($curResetAt -gt 0) { [DateTimeOffset]::FromUnixTimeSeconds($curResetAt).LocalDateTime.ToString('yyyy-MM-dd HH:mm:ss') } else { '未知' }
-$curRemaining = 100 - $curUsed
+$primaryWindow = $data.rate_limit.primary_window
+$secondaryWindow = $data.rate_limit.secondary_window
+
+$primaryUsed = [int]$primaryWindow.used_percent
+$primaryRemaining = 100 - $primaryUsed
+$primaryResetAt = [long]$primaryWindow.reset_at
+$primaryResetTime = Format-ResetAt $primaryResetAt
+$primaryWindowSeconds = [long]$primaryWindow.limit_window_seconds
+
+$secondaryAvailable = $null -ne $secondaryWindow
+$secondaryUsed = $null
+$secondaryRemaining = $null
+$secondaryResetAt = 0
+$secondaryResetTime = '未提供'
+$secondaryWindowSeconds = 0
+if ($secondaryAvailable) {
+  $secondaryUsed = [int]$secondaryWindow.used_percent
+  $secondaryRemaining = 100 - $secondaryUsed
+  $secondaryResetAt = [long]$secondaryWindow.reset_at
+  $secondaryResetTime = Format-ResetAt $secondaryResetAt
+  $secondaryWindowSeconds = [long]$secondaryWindow.limit_window_seconds
+}
 
 # ---- 仅查看状态 ----
 if ($ShowStatus) {
-  Write-Host "剩余额度:       $curRemaining%"
-  Write-Host "重置时间(预计): $curResetTime"
-  $data | ConvertTo-Json -Depth 10
+  Write-Host "短期窗口（约 $(Format-Duration $primaryWindowSeconds)）剩余: $primaryRemaining%"
+  Write-Host "短期窗口下次重置: $primaryResetTime"
+  if ($secondaryAvailable) {
+    Write-Host "7 天总额度剩余: $secondaryRemaining%"
+    Write-Host "7 天总额度预计重置: $secondaryResetTime"
+  } else {
+    Write-Host "7 天总额度: 接口暂未提供，监控不会发送重置邮件"
+  }
   exit 0
 }
 
-Write-Log "当前额度状态: 剩余=$curRemaining% 下次重置=$curResetTime"
+if ($secondaryAvailable) {
+  Write-Log "当前额度状态: 5小时剩余=$primaryRemaining%（$primaryResetTime 重置）；7天总额度剩余=$secondaryRemaining%（预计 $secondaryResetTime 重置）"
+} else {
+  Write-Log "当前额度状态: 5小时剩余=$primaryRemaining%（$primaryResetTime 重置）；未提供7天总额度窗口，已跳过重置提醒判断"
+}
 
-# 4. 与上次状态对比，判断是否发生了全量重置
+# 4. 只以 secondary_window（7 天总额度）判断重置。primary_window 的 5 小时正常恢复绝不发邮件。
 $prev = $null
 if (Test-Path $StateFile) {
   try { $prev = Get-Content $StateFile -Raw | ConvertFrom-Json } catch {}
 }
 
-$resetDetected = $false
-$detail = ""
-if ($prev) {
-  # 优先读取旧状态中的剩余额度；兼容早期只保存 used_percent 的状态文件。
-  $prevRemaining = if ($null -ne $prev.remaining) { [int]$prev.remaining } else { 100 - [int]$prev.used_percent }
-  # 判定补满：上次剩余较低(<=50%)，本次明显回升(>=80%)，说明本轮额度已重置。
-  if ($prevRemaining -le 50 -and $curRemaining -ge 80) {
-    $resetDetected = $true
-    $detail = "本轮剩余额度 $prevRemaining% → $curRemaining%（已补满）"
+$resetEventType = 'none'
+$detail = ''
+$shouldNotify = $false
+
+# 允许接口时间、计划任务 10 分钟间隔和临时网络失败造成的误差。实际检查晚于预计时间，永远算按期。
+$naturalResetEarlyToleranceMinutes = if ($null -ne $NaturalResetEarlyToleranceMinutes) { [int]$NaturalResetEarlyToleranceMinutes } else { 90 }
+$refillMinimumPercent = if ($null -ne $RefillMinimumPercent) { [int]$RefillMinimumPercent } else { 15 }
+$refillStartRemainingPercent = if ($null -ne $RefillStartRemainingPercent) { [int]$RefillStartRemainingPercent } else { 85 }
+$notificationCooldownHours = if ($null -ne $EarlyResetNotificationCooldownHours) { [int]$EarlyResetNotificationCooldownHours } else { 6 }
+
+if ($secondaryAvailable -and $prev -and $prev.secondary) {
+  $prevSecondaryRemaining = [int]$prev.secondary.remaining_percent
+  $prevSecondaryResetAt = [long]$prev.secondary.reset_at
+  $refillAmount = $secondaryRemaining - $prevSecondaryRemaining
+
+  # 只要总额度有明显回补就识别；不要求恰好 100%，避免 10 分钟检查间隔漏掉重置。
+  if ($prevSecondaryRemaining -le $refillStartRemainingPercent -and $refillAmount -ge $refillMinimumPercent) {
+    $nowUnix = [DateTimeOffset]::Now.ToUnixTimeSeconds()
+    $expectedResetTime = Format-ResetAt $prevSecondaryResetAt
+    if ($prevSecondaryResetAt -gt 0 -and $nowUnix -lt ($prevSecondaryResetAt - $naturalResetEarlyToleranceMinutes * 60)) {
+      $resetEventType = 'early'
+      $leadTime = Format-Duration ($prevSecondaryResetAt - $nowUnix)
+      $detail = "7天总额度提前回补：剩余 $prevSecondaryRemaining% → $secondaryRemaining%（原预计 $expectedResetTime 重置，提前约 $leadTime）"
+    } elseif ($prevSecondaryResetAt -gt 0) {
+      $resetEventType = 'scheduled'
+      $detail = "7天总额度按期重置：剩余 $prevSecondaryRemaining% → $secondaryRemaining%（原预计 $expectedResetTime）"
+    } else {
+      $resetEventType = 'unclassified'
+      $detail = "7天总额度出现回补：剩余 $prevSecondaryRemaining% → $secondaryRemaining%，但缺少上一轮预计时间，未发送邮件"
+    }
   }
-} else {
-  Write-Log "首次运行，记录初始状态，暂不发送通知"
+} elseif ($secondaryAvailable) {
+  Write-Log "7天总额度监控首次运行（或已从旧版升级），仅记录基线，不发送邮件"
 }
 
-# 4.1 防重复通知：检测到重置后 6 小时内不重复发邮件（冷却期）
-#     重置周期为 7 天，6 小时冷却不可能漏掉下一次真实重置
-$cooldownHours = 6
-$shouldNotify = $false
-if ($resetDetected) {
+# 只有提前回补才通知。按期重置只记日志，5 小时窗口的恢复不会走到这里。
+if ($resetEventType -eq 'early') {
   $skip = $false
-  if ($prev.last_notified_time) {
+  if ($prev.last_early_notified_time) {
     try {
-      $lastNotify = [DateTimeOffset]::Parse($prev.last_notified_time).LocalDateTime
+      $lastNotify = [DateTimeOffset]::Parse($prev.last_early_notified_time).LocalDateTime
       $elapsed = (Get-Date) - $lastNotify
-      if ($elapsed.TotalHours -lt $cooldownHours) {
+      if ($elapsed.TotalHours -lt $notificationCooldownHours) {
         $skip = $true
-        Write-Log "距上次通知仅 $([int]$elapsed.TotalMinutes) 分钟，冷却期内跳过重复通知"
+        Write-Log "距上次提前重置提醒仅 $([int]$elapsed.TotalMinutes) 分钟，冷却期内跳过重复邮件"
       }
     } catch {}
   }
   if (-not $skip) { $shouldNotify = $true }
 }
 
-# 5. 保存当前状态
-$notifiedTime = if ($shouldNotify) { (Get-Date -Format 'o') } elseif ($prev.last_notified_time) { $prev.last_notified_time } else { '' }
+if ($resetEventType -eq 'scheduled') { Write-Log $detail }
+if ($resetEventType -eq 'unclassified') { Write-Log $detail }
+
+# 5. 保存当前状态（状态文件 v2；第一次升级只建立 7 天窗口基线）。
+$lastEarlyNotifiedTime = if ($shouldNotify) { (Get-Date -Format 'o') } elseif ($prev -and $prev.last_early_notified_time) { $prev.last_early_notified_time } else { '' }
+$lastScheduledResetTime = if ($resetEventType -eq 'scheduled') { (Get-Date -Format 'o') } elseif ($prev -and $prev.last_scheduled_reset_time) { $prev.last_scheduled_reset_time } else { '' }
 $state = @{
-  checked_at          = (Get-Date -Format 'o')
-  used_percent        = $curUsed
-  remaining           = $curRemaining
-  reset_at            = $curResetAt
-  reset_time          = $curResetTime
-  last_notified_time  = $notifiedTime
-  raw                 = $data
+  schema_version                = 2
+  checked_at                    = (Get-Date -Format 'o')
+  primary                       = @{
+    remaining_percent = $primaryRemaining
+    reset_at          = $primaryResetAt
+    reset_time        = $primaryResetTime
+    window_seconds    = $primaryWindowSeconds
+  }
+  secondary                     = if ($secondaryAvailable) { @{
+    remaining_percent = $secondaryRemaining
+    reset_at          = $secondaryResetAt
+    reset_time        = $secondaryResetTime
+    window_seconds    = $secondaryWindowSeconds
+  } } else { $null }
+  last_early_notified_time      = $lastEarlyNotifiedTime
+  last_scheduled_reset_time     = $lastScheduledResetTime
+  last_reset_event_type         = $resetEventType
+  raw                           = $data
 }
 $state | ConvertTo-Json -Depth 20 | Set-Content -Path $StateFile -Encoding UTF8
 
-# 追加结构化数据到 CSV（每次检查都记，用于画图表）
-$prevUsedForCsv = if ($prev) { [int]$prev.used_percent } else { '' }
+# 追加结构化数据到 CSV（v2 单独保存，保留旧版 monitor_data.csv 历史）。
 $csvRow = @{
-  checked_at               = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-  used_percent             = $curUsed
-  remaining_percent        = $curRemaining
-  reset_at                 = $curResetAt
-  reset_at_time            = $curResetTime
-  reset_after_seconds      = $pw.reset_after_seconds
-  limit_window_seconds     = $pw.limit_window_seconds
-  plan_type                = $data.plan_type
-  limit_reached            = $data.rate_limit.limit_reached
-  credits_available_count  = $data.rate_limit_reset_credits.available_count
-  credits_has_credits      = $data.credits.has_credits
-  approx_local_messages    = ($data.credits.approx_local_messages -join '|')
-  approx_cloud_messages    = ($data.credits.approx_cloud_messages -join '|')
-  reset_detected           = if ($resetDetected) { 1 } else { 0 }
-  mail_sent                = if ($shouldNotify) { 1 } else { 0 }
-  prev_used_percent        = $prevUsedForCsv
+  checked_at                   = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+  primary_remaining_percent    = $primaryRemaining
+  primary_reset_at             = $primaryResetAt
+  primary_reset_at_time        = $primaryResetTime
+  primary_window_seconds       = $primaryWindowSeconds
+  secondary_remaining_percent  = $secondaryRemaining
+  secondary_reset_at           = $secondaryResetAt
+  secondary_reset_at_time      = $secondaryResetTime
+  secondary_window_seconds     = $secondaryWindowSeconds
+  reset_event_type             = $resetEventType
+  mail_sent                    = if ($shouldNotify) { 1 } else { 0 }
+  plan_type                    = $data.plan_type
+  limit_reached                = $data.rate_limit.limit_reached
 }
 Append-DataCsv $csvRow
 
-# 6. 检测到重置则发邮件
+# 6. 仅提前重置才发邮件。
 if ($shouldNotify) {
-  Write-Log "检测到额度重置！$detail"
-  $subject = "Codex 额度已补满：剩余 $curRemaining%"
-  $body = "你的 Codex(ChatGPT Plus) 本轮额度已重置。`r`n`r`n$detail`r`n`r`n当前剩余: $curRemaining%`r`n下次重置预计: $curResetTime`r`n检查时间: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`r`n`r`n—— codex-quota-monitor"
+  Write-Log "检测到7天总额度提前重置！$detail"
+  $subject = "Codex 7天总额度提前重置：剩余 $secondaryRemaining%"
+  $body = "这是提前重置提醒，不是 5 小时窗口的正常恢复。`r`n`r`n$detail`r`n`r`n当前7天总额度剩余: $secondaryRemaining%`r`n下一次预计重置: $secondaryResetTime`r`n检查时间: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`r`n`r`n—— codex-quota-monitor"
   Send-Mail $subject $body
 }
