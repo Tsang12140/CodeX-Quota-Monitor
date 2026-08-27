@@ -5,7 +5,7 @@
 仓库的 `.gitignore` 会排除以下文件：
 
 - `config.ps1`：SMTP 地址、收发邮箱与授权码；
-- `state.json`、`monitor.log`、`monitor_data.csv`：账号信息和个人使用历史；
+- `state.json`、`monitor.log`、`monitor_data.csv`、`monitor_data_v2.csv`：账号信息和个人使用历史；
 - `auth.json`、令牌、证书和密钥文件。
 
 提交前请运行 `git status`，确认暂存区中没有上述文件。尤其不要把
